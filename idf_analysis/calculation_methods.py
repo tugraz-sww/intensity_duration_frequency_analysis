@@ -5,95 +5,91 @@ __email__ = "markus.pichler@tugraz.at"
 __version__ = "0.1"
 __license__ = "MIT"
 
+import warnings
+
 import pandas as pd
 import numpy as np
-from numpy import NaN
-from math import e, floor, ceil
-from .sww_utils import guess_freq, rain_events, agg_events
-from .definitions import DWA, ATV, DWA_adv, PARTIAL, ANNUAL, LOG1, LOG2, HYP, LIN
+from math import e, floor
+from collections import OrderedDict
+from tqdm import tqdm
 
-# from my_helpers import check
-
-MAX_OSUM = 'max_overlapping_sum'
-
-
-def delta2min(time_delta):
-    """
-    convert timedelta to float in minutes
-    
-    :param time_delta:
-    :type time_delta: pd.Timedelta
-    
-    :return: delta in [min]
-    :rtype: float
-    """
-    # time_delta.total_seconds() / 60
-    return time_delta / pd.Timedelta(minutes=1)
+from .sww_utils import guess_freq, rain_events, agg_events, year_delta
+from .definitions import DWA, ATV, DWA_adv, PARTIAL, ANNUAL, LOG1, LOG2, HYP, LIN, COL, PARAM, PARAM_COL
 
 
 ########################################################################################################################
-def annual_series(events):
+def annual_series(rolling_sum_values, year_index):
     """
+    create an annual series of the maximum overlapping sum per year and calculate the "u" and "w" parameters
     acc. to DWA-A 531 chap. 5.1.5
-    
-    :param pd.DataFrame events:
-    :return: parameter u and w from the annual series for a specific duration step as a list
-    :rtype: tuple[float, float]
+
+    Args:
+        rolling_sum_values (numpy.ndarray): array with maximum rolling sum per event per year.
+        year_index (numpy.ndarray): array with year of the event.
+
+    Returns:
+        tuple[float, float]: parameter u and w from the annual series for a specific duration step as a tuple
     """
-    annually_series = pd.Series(data=events[MAX_OSUM].values, index=events['start'].values, name=MAX_OSUM).resample(
-        'AS').max()
-    annually_series = annually_series.sort_values(ascending=False).reset_index(drop=True)
+    annually_series = pd.Series(rolling_sum_values).groupby(year_index).max().values
+    # annually_series = pd.Series(data=rolling_sum_values,
+    #                             index=events[COL.START].values).resample('AS').max().index
+    annually_series = np.sort(annually_series)[::-1]
 
     mean_sample_rainfall = annually_series.mean()
-    sample_size = annually_series.count()
+    sample_size = annually_series.size
 
-    x = -np.log(np.log((sample_size + 0.2) / (sample_size - (annually_series.index.values + 1.0) + 0.6)))
+    index = np.arange(sample_size) + 1
+    x = -np.log(np.log((sample_size + 0.2) / (sample_size - index + 0.6)))
     x_mean = x.mean()
 
     w = ((x * annually_series).sum() - sample_size * mean_sample_rainfall * x_mean) / \
         ((x ** 2).sum() - sample_size * x_mean ** 2)
     u = mean_sample_rainfall - w * x_mean
 
-    return u, w
+    return {PARAM.U: u, PARAM.W: w}
 
 
 ########################################################################################################################
-def partial_series(events, measurement_period):
+def _plotting_formula(k, l, m):
     """
+    plotting function acc. to DWA-A 531 chap. 5.1.3 for the partial series
+
+    Args:
+        k (float): running index
+        l (float): sample size
+        m (float): measurement period
+
+    Returns:
+        float: estimated empirical return period
+    """
+    return (l + 0.2) * m / ((k - 0.4) * l)
+
+
+def partial_series(rolling_sum_values, measurement_period):
+    """
+    create an partial series of the largest overlapping sums and calculate the "u" and "w" parameters
     acc. to DWA-A 531 chap. 5.1.4
 
-    :param pd.DataFrame events:
-    :param float measurement_period:
-    :return: parameter u and w from the partial series for a specific duration step as a list
-    :rtype: tuple[float, float]
+    Args:
+        rolling_sum_values (numpy.ndarray): array with maximum rolling sum per event
+        measurement_period (float): in years
+
+    Returns:
+        tuple[float, float]: parameter u and w from the partial series for a specific duration step as a tuple
     """
-    partially_series = pd.Series(data=events[MAX_OSUM].values, name=MAX_OSUM)
-    partially_series = partially_series.sort_values(ascending=False).reset_index(drop=True)
+    partially_series = rolling_sum_values
+    partially_series = np.sort(partially_series)[::-1]
 
     # use only the (2-3 multiplied with the number of measuring years) of the biggest
     # values in the database (-> acc. to ATV-A 121 chap. 4.3; DWA-A 531 chap. 4.4)
     # as an requirement for the extreme value distribution
-
-    size_threshold_value = int(floor(measurement_period * e))
-    partially_series = partially_series.iloc[:size_threshold_value].copy()  # 1
+    threshold_sample_size = int(floor(measurement_period * e))
+    partially_series = partially_series[:threshold_sample_size]
 
     mean_sample_rainfall = partially_series.mean()
-    sample_size = partially_series.count()
-
-    # ------------------------------------------------------------------------------------------------------------------
-    def _plotting_formula(k, l, m):
-        """
-        plotting function acc. to DWA-A 531 chap. 5.1.3 for the partial series
-
-        :param k: running index
-        :param l: sample size
-        :param m: measurement period
-        :return: estimated empirical return period
-        """
-        return (l + 0.2) * m / ((k - 0.4) * l)
-
-    # ------------------------------------------------------------------------------------------------------------------
-    log_return_periods = np.log(_plotting_formula(partially_series.index.values + 1, sample_size, measurement_period))
+    sample_size = threshold_sample_size
+    index = np.arange(sample_size) + 1
+    log_return_periods = np.log(_plotting_formula(index, sample_size, measurement_period))
     ln_t_n_mean = log_return_periods.mean()
 
     w = ((log_return_periods * partially_series).sum() - sample_size * mean_sample_rainfall * ln_t_n_mean) / \
@@ -101,100 +97,7 @@ def partial_series(events, measurement_period):
 
     u = mean_sample_rainfall - w * ln_t_n_mean
 
-    return u, w
-
-
-########################################################################################################################
-def calculate_u_wXX(file_input, duration_steps, measurement_period, series_kind):
-    """
-    statistical analysis for each duration step acc. to DWA-A 531 chap. 5.1
-    save the parameters of the distribution function as interim results
-    acc. to DWA-A 531 chap. 4.4: use the annual series only for measurement periods over 20 years
-
-    :param pd.Series file_input: original nieda-database
-    
-    :param duration_steps: in [min]
-    :type duration_steps: list[int] | np.ndarray
-    
-    :param measurement_period: duration of the series in [a]
-    :type measurement_period: float
-    
-    :param series_kind: annual or partial
-    :type series_kind: str
-    
-    :return: with index = duration and columns = [u, w]
-    :rtype: pd.DataFrame
-    """
-    # check('start')
-    ts = file_input.copy()
-    # ts = ts.dropna()
-    base_frequency = guess_freq(file_input.index)  # DateOffset/Timedelta
-    ts = ts.resample(base_frequency).sum()
-
-    # ts = ts.asfreq(base_frequency)
-    # ts = ts.fillna(0)
-
-    # ------------------------------------------------------------------------------------------------------------------
-    def _calc_overlapping_sum_max(event, duration):
-        """
-        calculation of the maximum of the overlapping sum of the series
-        acc. to DWA-A 531 chap. 4.2
-        
-        :param event: event
-        :type event: pd.Series
-
-        :param duration: of the calculation step
-        :type duration: pd.Timedelta
-        
-        :return: maximum of the overlapping sum
-        :rtype float
-        """
-        data = ts.loc[event['start']:event['end']].copy()
-        interval = int(round(duration / base_frequency))
-
-        # correction factor acc. to DWA-A 531 chap. 4.3
-        improve = [1.140, 1.070, 1.040, 1.030]
-
-        if interval == 1:
-            return data.max() * improve[0]
-
-        data = data.rolling(window=interval).sum()
-
-        if interval > 4:
-            return data.max()
-        else:
-            return data.max() * improve[interval - 1]
-
-    # ------------------------------------------------------------------------------------------------------------------
-    interim_results = pd.DataFrame(index=duration_steps, columns=['u', 'w'], dtype=float)
-    interim_results.index.name = 'duration'
-
-    # acc. to DWA-A 531 chap. 4.2:
-    # The values must be independent of each other for the statistical evaluations.
-    # estimated four hours acc. (SCHILLING 1984)
-    # for larger durations - use the duration as minimal gap
-    minimal_gap = pd.Timedelta(hours=4)
-    # check('Events')
-    events = rain_events(file_input, ignore_rain_below=0.0, min_gap=minimal_gap)
-    # check(' - done')
-    for duration_index in duration_steps:
-        print(duration_index)
-        duration = pd.Timedelta(minutes=duration_index)
-        if duration > minimal_gap:
-            events = rain_events(file_input, ignore_rain_below=0.0, min_gap=duration)
-
-        # check('osum')
-        events[MAX_OSUM] = events.apply(_calc_overlapping_sum_max, axis=1, duration=duration)
-
-        # check('series calc')
-        if series_kind == ANNUAL:
-            interim_results.loc[duration_index] = annual_series(events)
-        elif series_kind == PARTIAL:
-            interim_results.loc[duration_index] = partial_series(events, measurement_period)
-        else:
-            raise NotImplementedError
-        # check(' - done')
-    return interim_results
+    return {PARAM.U: u, PARAM.W: w}
 
 
 ########################################################################################################################
@@ -202,48 +105,55 @@ def _improve_factor(interval):
     """
     correction factor acc. to DWA-A 531 chap. 4.3
 
-    :param interval: length of the interval: number of observations per duration
-    :type interval: float
-    :return: correction factor
-    :rtype: float
-    """
-    improve_factor = pd.Series({1: 1.14,
-                                2: 1.07,
-                                3: 1.04,
-                                4: 1.03,
-                                5: 1.00,
-                                6: 1.00})
+    Args:
+        interval (float): length of the interval: number of observations per duration
 
-    return np.interp(interval, improve_factor.index, improve_factor)
+    Returns:
+        float: correction factor
+    """
+    improve_factor = {1: 1.14,
+                      2: 1.07,
+                      3: 1.04,
+                      4: 1.03,
+                      5: 1.00,
+                      6: 1.00}
+
+    return np.interp(interval,
+                     list(improve_factor.keys()),
+                     list(improve_factor.values()))
 
 
 ########################################################################################################################
-def calculate_u_w(file_input, duration_steps, measurement_period, series_kind):
+def calculate_u_w(file_input, duration_steps, series_kind):
     """
     statistical analysis for each duration step acc. to DWA-A 531 chap. 5.1
     save the parameters of the distribution function as interim results
     acc. to DWA-A 531 chap. 4.4: use the annual series only for measurement periods over 20 years
 
-    :param pd.Series file_input: original nieda-database
 
-    :param duration_steps: in [min]
-    :type duration_steps: list[int] | np.ndarray
+    Args:
+        file_input (pandas.Series): precipitation data
+        duration_steps (list[int] | numpy.ndarray): in minutes
+        series_kind (str): annual or partial
 
-    :param measurement_period: duration of the series in [a]
-    :type measurement_period: float
-
-    :param series_kind: annual or partial
-    :type series_kind: str
-
-    :return: with index = duration and columns = [u, w]
-    :rtype: pd.DataFrame
+    Returns:
+        pandas.DataFrame: with key=durations and values=dict(u, w)
     """
     ts = file_input.copy()
-    base_frequency = guess_freq(file_input.index)  # DateOffset/Timedelta
+    # -------------------------------
+    # measuring time in years
+    measurement_start, measurement_end = ts.index[[0, -1]]
+    measurement_period = (measurement_end - measurement_start) / year_delta(years=1)
+    if round(measurement_period, 1) < 10:
+        warnings.warn("The measurement period is too short. The results may be inaccurate! "
+                      "It is recommended to use at least ten years. "
+                      "(-> Currently {}a used)".format(measurement_period))
+
+    # -------------------------------
+    base_frequency = guess_freq(ts.index)  # DateOffset/Timedelta
 
     # ------------------------------------------------------------------------------------------------------------------
-    interim_results = pd.DataFrame(index=duration_steps, columns=['u', 'w'], dtype=float)
-    interim_results.index.name = 'duration'
+    interim_results = dict()
 
     # -------------------------------
     # acc. to DWA-A 531 chap. 4.2:
@@ -255,32 +165,52 @@ def calculate_u_w(file_input, duration_steps, measurement_period, series_kind):
     # may increase design-rain-height of smaller durations
     #
     # -------------------------------
+    pbar = tqdm(duration_steps, desc='Calculating Parameters u and w')
+    for duration_integer in pbar:
+        pbar.set_description('Calculating Parameters u and w for duration {:0.0f}'.format(duration_integer))
 
-    for duration_integer in duration_steps:
         duration = pd.Timedelta(minutes=duration_integer)
 
         if duration < pd.Timedelta(base_frequency):
             continue
 
-        events = rain_events(file_input, min_gap=duration)
+        events = rain_events(ts, min_gap=duration)
 
         # correction factor acc. to DWA-A 531 chap. 4.3
         improve = _improve_factor(duration / base_frequency)
 
-        events[MAX_OSUM] = agg_events(events, ts.rolling(duration).sum(), 'max') * improve
+        roll_sum = ts.rolling(duration).sum()
+
+        # events[COL.Mrolling_sum_valuesAX_OVERLAPPING_SUM] = agg_events(events, roll_sum, 'max') * improve
+        rolling_sum_values = agg_events(events, roll_sum, 'max') * improve
 
         if series_kind == ANNUAL:
-            interim_results.loc[duration_integer] = annual_series(events)
+            interim_results[duration_integer] = annual_series(rolling_sum_values, events[COL.START].year.values)
         elif series_kind == PARTIAL:
-            interim_results.loc[duration_integer] = partial_series(events, measurement_period)
+            interim_results[duration_integer] = partial_series(rolling_sum_values, measurement_period)
         else:
             raise NotImplementedError
 
+    # -------------------------------
+    interim_results = pd.DataFrame.from_dict(interim_results, orient='index')
+    interim_results.index.name = COL.DUR
     return interim_results
 
 
 ########################################################################################################################
 def folded_log_formulation(duration, param, case, param_mean=None, duration_mean=None):
+    """
+
+    Args:
+        duration:
+        param:
+        case:
+        param_mean:
+        duration_mean:
+
+    Returns:
+
+    """
     if param_mean and duration_mean:
         mean_ln_duration = np.log(duration_mean)
         mean_ln_param = np.log(param_mean)
@@ -304,11 +234,25 @@ def folded_log_formulation(duration, param, case, param_mean=None, duration_mean
     else:
         raise NotImplementedError
 
-    return a, b
+    return float(a), float(b)
 
 
 ########################################################################################################################
 def hyperbolic_formulation(duration, param, a_start=20.0, b_start=15.0, param_mean=None, duration_mean=None):
+    """
+
+    Args:
+        duration:
+        param:
+        a_start:
+        b_start:
+        param_mean:
+        duration_mean:
+
+    Returns:
+
+    """
+
     # ------------------------------------------------------------------------------------------------------------------
     def get_param(dur, par, a_, b_):
         i = -a_ / (dur + b_)
@@ -341,206 +285,277 @@ def hyperbolic_formulation(duration, param, a_start=20.0, b_start=15.0, param_me
         b = (b + b_s) / 2
 
         iteration_steps += 1
-    return a, b
-
-
-########################################################################################################################
-def formulation(approach, duration, param, a_start=20.0, b_start=15.0, param_mean=None, duration_mean=None):
-    if approach in [LOG1, LOG2]:
-        return folded_log_formulation(duration, param, case=approach, param_mean=param_mean,
-                                      duration_mean=duration_mean)
-
-    elif approach == HYP:
-        return hyperbolic_formulation(duration, param, a_start=a_start, b_start=b_start, param_mean=param_mean,
-                                      duration_mean=duration_mean)
-
-    elif approach == LIN:
-        return NaN, NaN
-    else:
-        raise NotImplementedError
+    return float(a), float(b)
 
 
 ########################################################################################################################
 def get_duration_steps(worksheet):
     """
-    duration step boundary for the diverse distribution functions
+    duration step boundary for the various distribution functions in minutes
 
-    :param str worksheet:
-    :rtype: list[int, int]
+    Args:
+        worksheet (str):
+
+    Returns:
+        tuple[int, int]: duration steps in minutes
     """
-    dur_steps = {
+    return {
         # acc. to ATV-A 121 chap. 5.2 (till 2012)
-        ATV: [60 * 3, 60 * 48],
+        ATV: (60 * 3, 60 * 48),
         # acc. to DWA-A 531 chap. 5.2.1
-        DWA_adv: [60 * 3, 60 * 24],
+        DWA_adv: (60 * 3, 60 * 24),
         # acc. to DWA-A 531 chap. 5.2.1
-        DWA: [60, 60 * 12]
-    }
-    return dur_steps[worksheet]
+        DWA: (60, 60 * 12)
+    }[worksheet]
 
 
 ########################################################################################################################
-def get_approach_table(worksheet):
-    df = pd.DataFrame(columns=['von', 'bis', 'u', 'w', 'a_u', 'b_u', 'a_w', 'b_w'])
+def get_approaches(worksheet):
+    """
+    approaches depending on the duration and the parameter
+
+    Args:
+        worksheet (str): worksheet name for the analysis:
+            - 'DWA-A_531'
+            - 'ATV-A_121'
+            - 'DWA-A_531_advektiv' (yet not implemented)
+
+    Returns:
+        list[dict]: table of approaches depending on the duration and the parameter
+    """
+    approach_list = list()
 
     # acc. to ATV-A 121 chap. 5.2.1
     if worksheet == ATV:
-        df = df.append(dict(von=None, bis=None, u=LOG2, w=LOG1), ignore_index=True)
+        approach_list.append(OrderedDict({PARAM_COL.FROM: None,
+                                          PARAM_COL.TO: None,
+                                          PARAM_COL.U: LOG2,
+                                          PARAM_COL.W: LOG1}))
 
     elif worksheet == DWA:
         duration_bound_1, duration_bound_2 = get_duration_steps(worksheet)
 
-        df = df.append(dict(von=0, bis=duration_bound_1,
-                            u=HYP, w=LOG2), ignore_index=True)
-        df = df.append(dict(von=duration_bound_1, bis=duration_bound_2,
-                            u=LOG2, w=LOG2), ignore_index=True)
-        df = df.append(dict(von=duration_bound_2, bis=np.inf,
-                            u=LIN, w=LIN), ignore_index=True)
+        approach_list.append(OrderedDict({PARAM_COL.FROM: 0,
+                                          PARAM_COL.TO: duration_bound_1,
+                                          PARAM_COL.U: HYP,
+                                          PARAM_COL.W: LOG2}))
+        approach_list.append(OrderedDict({PARAM_COL.FROM: duration_bound_1,
+                                          PARAM_COL.TO: duration_bound_2,
+                                          PARAM_COL.U: LOG2,
+                                          PARAM_COL.W: LOG2}))
+        approach_list.append(OrderedDict({PARAM_COL.FROM: duration_bound_2,
+                                          PARAM_COL.TO: np.inf,
+                                          PARAM_COL.U: LIN,
+                                          PARAM_COL.W: LIN}))
 
     else:
         raise NotImplementedError
 
-    return df
+    return approach_list
+
+
+def split_interim_results(parameter, interim_results):
+    new_parameters = list()
+    for i, row in enumerate(parameter):
+        it_res = interim_results.loc[row[PARAM_COL.FROM]: row[PARAM_COL.TO]]
+        if it_res.empty or it_res.index.size == 1:
+            continue
+        row[COL.DUR] = list(map(int, it_res.index.values))
+        for p in PARAM.U_AND_W:  # u or w
+            row[PARAM_COL.VALUES(p)] = list(map(float, it_res[p].values))
+        new_parameters.append(row)
+
+    return new_parameters
 
 
 ########################################################################################################################
-def get_parameter(interim_results, worksheet=DWA):
-    parameter = get_approach_table(worksheet)
+def _calc_params(parameter, params_mean=None, duration_mean=None):
+    """
+    calculate parameters a_u, a_w, b_u and b_w and add it to the dict
 
-    # ------------------------------------------------------------------------------------------------------------------
-    def _calc_params(parameter_, params_mean=None, duration_mean=None):
-        parameters = parameter_.copy()
-        for index, row in parameters.iterrows():
-            it_res = interim_results.loc[row['von']: row['bis']]
-            if it_res.empty:
-                continue
-            for p in ['u', 'w']:
-                param = it_res[p].values
-                dur = it_res.index.values
-                approach = row[p]
-                if params_mean:
-                    param_mean = params_mean[p]
-                else:
-                    param_mean = None
+    Args:
+        parameter (list[dict]):
+        params_mean (dict[float]):
+        duration_mean (float):
 
-                a_start = row.loc['a_{}'.format(p)]
-                b_start = row.loc['b_{}'.format(p)]
-                if np.isnan(a_start):
-                    a_start = 20.0
-                if np.isnan(b_start):
-                    b_start = 15.0
+    Returns:
+        list[dict]: parameters
+    """
+    for row in parameter:
+        if not COL.DUR in row:
+            continue
 
-                a, b = formulation(approach, dur, param, a_start=a_start, b_start=b_start,
-                                   param_mean=param_mean, duration_mean=duration_mean)
-                parameters.loc[index, 'a_{}'.format(p)] = a
-                parameters.loc[index, 'b_{}'.format(p)] = b
-        return parameters
+        dur = np.array(row[COL.DUR])
 
-    # ------------------------------------------------------------------------------------------------------------------
-    parameter = _calc_params(parameter)
+        for p in PARAM.U_AND_W:  # u or w
+            a_label = PARAM_COL.A(p)  # a_u or a_w
+            b_label = PARAM_COL.B(p)  # b_u or b_w
 
-    # the balance between the different duration ranges acc. to DWA-A 531 chap. 5.2.4
-    duration_step = parameter['bis'][0]
-    durations = np.array([duration_step - 0.001, duration_step + 0.001])
+            param = np.array(row[PARAM_COL.VALUES(p)])  # values for u or w of the annual/partial series
 
-    if any(durations < interim_results.index.values.min()):
-        return parameter
+            approach = row[p]
+            if params_mean:
+                param_mean = params_mean[p]
+            else:
+                param_mean = None
 
-    u, w = get_u_w(durations, parameter, interim_results)
-    parameter = _calc_params(parameter, params_mean=dict(u=np.mean(u), w=np.mean(w)), duration_mean=duration_step)
+            # ----------------------------
+            if approach in [LOG1, LOG2]:
+                row[a_label], row[b_label] = folded_log_formulation(dur, param, case=approach,
+                                                                    param_mean=param_mean, duration_mean=duration_mean)
+
+            # ----------------------------
+            elif approach == HYP:
+                a_start = 20.0
+                if a_label in row and not np.isnan(row[a_label]):
+                    a_start = row[a_label]
+
+                b_start = 15.0
+                if b_label in row and not np.isnan(row[b_label]):
+                    b_start = row[b_label]
+
+                row[a_label], row[b_label] = hyperbolic_formulation(dur, param, a_start=a_start, b_start=b_start,
+                                                                    param_mean=param_mean, duration_mean=duration_mean)
+
+            # ----------------------------
+            elif approach == LIN:
+                pass
+
+            # ----------------------------
+            else:
+                raise NotImplementedError
+
+            # ----------------------------
+
     return parameter
 
 
 ########################################################################################################################
-def get_u_w(duration, parameter, interim_results):
-    if isinstance(duration, list):
-        duration = np.array(duration)
+def get_parameters(interim_results, worksheet=DWA):
+    """
+    get calculation parameters
 
-    # ------------------------------------------------------------------------------------------------------------------
-    def _calc_param(a, b, duration, approach, interim_results):
-        """
-        calc u(D) or w(D)
+    Args:
+        interim_results (pandas.DataFrame):
+        worksheet (str):
 
-        :type a: float | int
-        :type b: float | int
-        :type duration: float | np.array
-        :type approach: str
-        :type interim_results:
-        :rtype:
-        """
-        if approach == LOG1:
-            return a + b * np.log(duration)
-        elif approach == LOG2:
-            return np.exp(a) * np.power(duration, b)
-        elif approach == HYP:
-            return a * duration / (duration + b)
-        elif approach == LIN:
-            return np.interp(duration, interim_results.index.values, interim_results.values)
-        else:
-            raise NotImplementedError
+    Returns:
+        list[dict]: parameters
+    """
+    parameter = get_approaches(worksheet)
+    parameter = split_interim_results(parameter, interim_results)
+    parameter = _calc_params(parameter)
 
-    # ------------------------------------------------------------------------------------------------------------------
-    res = {}
-    for index, row in parameter.iterrows():
+    # -------------------------------------------------------------
+    # the balance between the different duration ranges acc. to DWA-A 531 chap. 5.2.4
+    duration_step = parameter[0][PARAM_COL.TO]
+    durations = np.array([duration_step - 0.001, duration_step + 0.001])
 
-        if isinstance(duration, (int, float)):
-            if not (duration > row['von']) & (duration <= row['bis']):
-                continue
-            else:
-                dur = duration
-        else:
-            dur = duration[(duration > row['von']) & (duration <= row['bis'])]
-            if not dur.size:
-                continue
+    if any(durations < interim_results.index.values.min()) or any(durations > interim_results.index.values.max()):
+        return parameter
 
-        for p in ['u', 'w']:
-            approach = row[p]
-            a, b = row.loc[['{}_{}'.format(i, p) for i in ['a', 'b']]]
-            new = _calc_param(a, b, dur, approach, interim_results[p])
-            if p in res:
-                res[p] = np.array(list(res[p]) + list(new))
-            else:
-                res[p] = new
-    return [res[i] for i in ['u', 'w']]
+    u, w = get_u_w(durations, parameter)
+    parameter = _calc_params(parameter, params_mean=dict(u=np.mean(u), w=np.mean(w)), duration_mean=duration_step)
+    # -------------------------------------------------------------
+    return parameter
 
 
 ########################################################################################################################
-def depth_of_rainfall(u, w, series_kind, return_period):
-    if series_kind == ANNUAL and return_period <= 10:
-        return_period_asteriks = np.exp(1.0 / return_period) / (np.exp(1.0 / return_period) - 1.0)
-        return u + w * (-np.log(np.log(return_period_asteriks / (return_period_asteriks - 1.0))))
-
-    elif series_kind == ANNUAL and return_period > 10:
-        return u + w * (-np.log(np.log(return_period / (return_period - 1.0))))
-
-    else:
-        return u + w * np.log(return_period)
+def get_row(duration, parameter):
+    for row in parameter:
+        if row[PARAM_COL.FROM] <= duration <= row[PARAM_COL.TO]:
+            return row
 
 
-def minutes_readable(minutes):
-    if minutes <= 60:
-        return '{:0.0f}min'.format(minutes)
-    elif 60 < minutes < 60 * 24:
-        minutes /= 60
-        if minutes % 1:
-            fmt = '{:0.1f}h'
-        else:
-            fmt = '{:0.0f}h'
-        return fmt.format(minutes)
-    elif 60 * 24 <= minutes:
-        minutes /= 60 * 24
-        if minutes % 1:
-            fmt = '{:0.1f}d'
-        else:
-            fmt = '{:0.0f}d'
-        return fmt.format(minutes)
-    else:
-        return str(minutes)
+def get_scalar_param(p, duration, parameter):
+    """
+
+    Args:
+        duration (float | int): in minutes
+        parameter (list[dict]):
+
+    Returns:
+        (float, float): u, w
+    """
+    row = get_row(duration, parameter)
+
+    if row is None:
+        return np.NaN
+
+    approach = row[p]
+
+    if approach == LOG1:
+        a = row[PARAM_COL.A(p)]
+        b = row[PARAM_COL.B(p)]
+        return a + b * np.log(duration)
+
+    elif approach == LOG2:
+        a = row[PARAM_COL.A(p)]
+        b = row[PARAM_COL.B(p)]
+        return np.exp(a) * np.power(duration, b)
+
+    elif approach == HYP:
+        a = row[PARAM_COL.A(p)]
+        b = row[PARAM_COL.B(p)]
+        return a * duration / (duration + b)
+
+    elif approach == LIN:
+        return np.interp(duration, row[COL.DUR], row[PARAM_COL.VALUES(p)])
+
+
+def get_array_param(p, duration, parameter):
+    """
+
+    Args:
+        duration (numpy.ndarray): in minutes
+        parameter (list[dict]):
+
+    Returns:
+        (numpy.ndarray, numpy.ndarray): u, w
+    """
+    return np.vectorize(lambda d: get_scalar_param(p, d, parameter))(duration)
 
 
 ########################################################################################################################
-def duration_steps_readable(durations):
-    duration_strings = list()
-    for i, minutes in enumerate(durations):
-        duration_strings.append(minutes_readable(minutes))
-    return duration_strings
+def get_u_w(duration, parameter):
+    """
+
+    Args:
+        duration (numpy.ndarray| list | float | int): in minutes
+        parameter (list[dict]):
+
+    Returns:
+        (float, float): u, w
+    """
+    if isinstance(duration, (list, np.ndarray)):
+        func = get_array_param
+    else:
+        func = get_scalar_param
+
+    return (func(p, duration, parameter) for p in PARAM.U_AND_W)
+
+
+########################################################################################################################
+def depth_of_rainfall(u, w, return_period, series_kind):
+    """
+    calculate the height of the rainfall h in L/m² = mm
+
+    Args:
+        u (float): parameter depending on duration
+        w (float): parameter depending on duration
+        return_period (float): in years
+        series_kind (str): ['partial', 'annual']
+
+    Returns:
+        float: height of the rainfall h in L/m² = mm
+    """
+    if series_kind == ANNUAL:
+        if return_period <= 10:
+            return_period = np.exp(1.0 / return_period) / (np.exp(1.0 / return_period) - 1.0)
+
+        log_tn = -np.log(np.log(return_period / (return_period - 1.0)))
+
+    else:
+        log_tn = np.log(return_period)
+
+    return u + w * log_tn

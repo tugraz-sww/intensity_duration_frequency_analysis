@@ -6,16 +6,20 @@ __version__ = "1.0.0"
 __maintainer__ = "David Camhy, Markus Pichler"
 
 import pytz
-from tzlocal import get_localzone
 from datetime import tzinfo
 import pandas as pd
 from pandas.tseries.frequencies import to_offset
-from pandas.tseries.offsets import _delta_to_tick as delta_to_freq
-from pandas import DatetimeIndex, DateOffset, Timedelta, DataFrame
+import numpy as np
+
+from .definitions import COL
 
 
 class TimezoneError(Exception):
     """Some Error With a Timezone"""
+
+
+class IdfError(Exception):
+    """Some Error Within this Package"""
 
 
 def check_tz(timezone):
@@ -40,18 +44,18 @@ def check_tz(timezone):
         raise TimezoneError('unknown timezone format: "{}"'.format(type(timezone)))
 
 
-def remove_timezone(df):
+def remove_timezone(data):
     """
     convert the timezone to wintertime and then remove the timezone from the dataframe index, to not get in conflict
     with the plot functions
 
-    :param df: data
-    :type df: DataFrame
+    Args:
+        data (pandas.DataFrame | pandas.Series): data with datetimeindex 
 
-    :return: converted data
-    :rtype: DataFrame
+    Returns:
+        pandas.DataFrame | pandas.Series: data with datetimeindex without timezone
     """
-    no_tz = df.copy()
+    no_tz = data.copy()
     index = no_tz.index
     native_timezone = pytz.timezone('Etc/GMT-1')
     if index.tz is None:
@@ -65,30 +69,24 @@ def remove_timezone(df):
 ########################################################################################################################
 def guess_freq(date_time_index, default=pd.Timedelta(minutes=1)):
     """
-    return most often frequency in the format [minutes]T eg: "1T" when the frequency is one minute
+    guess the frequency by evaluating the most often frequency
 
-    :param DatetimeIndex date_time_index:
-    :param Timedelta default:
-    :rtype: DateOffset
+    Args:
+        date_time_index (pandas.DatetimeIndex): index of a time-series
+        default (pandas.Timedelta):
+
+    Returns:
+        pandas.DateOffset: frequency of the date-time-index
     """
-
-    # ---------------------------------
-    def _get_freq(freq):
-        if isinstance(freq, str):
-            freq = to_offset(freq)
-
-        return freq
-
-    # ---------------------------------
     freq = date_time_index.freq
     if pd.notnull(freq):
-        return _get_freq(freq)
+        return to_offset(freq)
 
     if not len(date_time_index) <= 3:
         freq = pd.infer_freq(date_time_index)  # 'T'
 
         if pd.notnull(freq):
-            return _get_freq(freq)
+            return to_offset(freq)
 
         delta_series = date_time_index.to_series().diff(periods=1).fillna(method='backfill')
         counts = delta_series.value_counts()
@@ -103,8 +101,7 @@ def guess_freq(date_time_index, default=pd.Timedelta(minutes=1)):
     else:
         delta = default
 
-    freq = delta_to_freq(delta)
-    return _get_freq(freq)
+    return to_offset(delta)
 
 
 ########################################################################################################################
@@ -117,19 +114,14 @@ def rain_events(series, ignore_rain_below=0, min_gap=pd.Timedelta(hours=4)):
     """
     get rain events as a table with start and end times
 
-    :param series: rain series
-    :type series: pd.Series
+    Args:
+        series (pandas.Series): rain series
+        ignore_rain_below (float): where it is considered as rain
+        min_gap (pandas.Timedelta): 4 hours of no rain between events
 
-    :param ignore_rain_below: where it is considered as rain
-    :type ignore_rain_below: float
-
-    :param min_gap: 4 hours of no rain between events
-    :type min_gap: pd.Timedelta
-
-    :return: table of the rain events
-    :rtype: pd.DataFrame
+    Returns:
+        pandas.DataFrame: table of the rain events
     """
-
     # best OKOSTRA adjustment with 0.0
     # by ignoring 0.1 mm the results are getting bigger
 
@@ -146,28 +138,126 @@ def rain_events(series, ignore_rain_below=0, min_gap=pd.Timedelta(hours=4)):
     event_start = event_start.sort_values().reset_index(drop=True)
 
     events = pd.concat([event_start, event_end], axis=1, ignore_index=True)
-    events.columns = ['start', 'end']
+    events.columns = [COL.START, COL.END]
     return events
+
+
+def event_number_to_series(events, index):
+    """
+    make a time-series where the value of the event number is paste to the <index>
+
+    Args:
+        events (pandas.DataFrame):
+        index (pandas.DatetimeIndex):
+
+    Returns:
+        pandas.Series:
+    """
+    ts = pd.Series(index=index)
+
+    events_dict = events.to_dict(orient='index')
+    for event_no, event in events_dict.items():
+        ts[event[COL.START]: event[COL.END]] = event_no
+
+    return ts
 
 
 ########################################################################################################################
 def agg_events(events, series, agg='sum'):
     """
 
-    :param events: table of events
-    :type events: pd.DataFrame
+    Args:
+        events (pandas.DataFrame): table of events
+        series (pandas.Series): time-series data
+        agg (str | function): aggregation of time-series
 
-    :param series: timeseries data
-    :type series: pd.Series
+    Returns:
+        numpy.ndarray: result of function of every event
+    """
+    if events.empty:
+        return np.array([])
 
-    :param agg: aggregation of timeseries
-    :type agg: str | function
+    if events.index.size > 3500:
+        res = series.groupby(event_number_to_series(events, series.index)).agg(agg).values
+    else:
+        res = events.apply(lambda event: series[event[COL.START]:event[COL.END]].agg(agg), axis=1).values
+    return res
 
-    :return: result of function of every event
-    :rtype: pd.Series
+
+########################################################################################################################
+def event_duration(events):
+    """
+    calculate the event duration
+
+    Args:
+        events (pandas.DataFrame): table of events with COL.START and COL.END times
+
+    Returns:
+        pandas.Series: duration of each event
+    """
+    return events[COL.END] - events[COL.START]
+
+
+########################################################################################################################
+def rain_bar_plot(rain, ax=None, color=None, reverse=False):
+    """
+    make a standard precipitation/rain plot
+
+    Args:
+        rain (pandas.Series):
+        ax (matplotlib.axes.Axes):
+        ylabel (str):
+        color (str):
+        reverse (bool):
+
+    Returns:
+        matplotlib.axes.Axes: rain plot
+    """
+    if color is None:
+        color = '#1E88E5'
+
+    ax = rain.plot(ax=ax, drawstyle='steps-mid', color=color, solid_capstyle='butt', solid_joinstyle='miter')
+    ax.fill_between(rain.index, rain.values, 0, step='mid', zorder=1000, color=color)
+
+    if reverse:
+        # ax.set_ylim(top=0, bottom=rain.max() * 1.1)
+        ax.set_ylim(bottom=0)
+        ax.invert_yaxis()
+    else:
+        ax.set_ylim(bottom=0)
+
+    return ax
+
+
+########################################################################################################################
+def resample_rain_series(series):
     """
 
-    def _agg_event(event):
-        return series[event['start']:event['end']].agg(agg)
+    Args:
+        series (pandas.Series):
 
-    return events.apply(_agg_event, axis=1)
+    Returns:
+        tuple[pandas.Series, int]: the resampled series AND the final frequency in minutes
+    """
+    resample_minutes = (
+        (pd.Timedelta(hours=5), 1),
+        (pd.Timedelta(hours=12), 2),
+        (pd.Timedelta(days=1), 5),
+        (pd.Timedelta(days=2), 10),
+        (pd.Timedelta(days=3), 15),
+        (pd.Timedelta(days=4), 20)
+    )
+
+    dur = series.index[-1] - series.index[0]
+    freq = guess_freq(series.index)
+
+    minutes = 1
+    for duration_limit, minutes in resample_minutes:
+        if dur < duration_limit:
+            break
+
+    if freq.delta > pd.Timedelta(minutes=minutes):
+        return series, int(freq / pd.Timedelta(minutes=1))
+
+    # print('resample_rain_series: ', dur, duration_limit, minutes)
+    return series.resample('{}T'.format(minutes)).sum(), minutes
